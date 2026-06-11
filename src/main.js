@@ -20,6 +20,8 @@ const state = {
   uploadStartedAt: 0,
   activeRequest: null,
   activeUploadId: '',
+  activeJobId: '',
+  activeEventSource: null,
   didCancel: false
 }
 
@@ -240,11 +242,16 @@ async function convertVideoCodec() {
 }
 
 async function convertRemoteVideo(codec) {
-  refs.progressShell.classList.add('is-indeterminate')
-  refs.statusText.textContent = '服务器下载并转码'
-  renderProgress(35, '处理中')
+  refs.statusText.textContent = '创建转换任务'
+  renderProgress(1, '准备中')
 
-  const result = await requestRemoteConversion(codec)
+  const { jobId } = await createRemoteJob(codec)
+  state.activeJobId = jobId
+  await watchRemoteJob(jobId)
+
+  refs.statusText.textContent = '下载转换结果'
+  renderProgress(98, '下载中')
+  const result = await downloadRemoteJob(jobId)
   const filename = getFilenameFromDisposition(result.disposition) || `video-${codec}.mp4`
   state.outputUrl = URL.createObjectURL(result.blob)
   refs.downloadBtn.href = state.outputUrl
@@ -255,12 +262,88 @@ async function convertRemoteVideo(codec) {
   renderProgress(100)
 }
 
-function requestRemoteConversion(codec) {
+async function createRemoteJob(codec) {
+  const response = await fetch('/api/url-jobs', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      codec,
+      url: state.videoUrl
+    })
+  })
+
+  if (!response.ok) {
+    throw new Error(await readResponseError(response))
+  }
+
+  return response.json()
+}
+
+function watchRemoteJob(jobId) {
+  return new Promise((resolvePromise, reject) => {
+    const events = new EventSource(`/api/url-jobs/${jobId}/events`)
+    state.activeEventSource = events
+
+    events.onmessage = (event) => {
+      const job = JSON.parse(event.data)
+      renderRemoteJobProgress(job)
+
+      if (job.status === 'done') {
+        events.close()
+        state.activeEventSource = null
+        resolvePromise(job)
+      }
+
+      if (job.status === 'error') {
+        events.close()
+        state.activeEventSource = null
+        reject(new Error(job.error || '转换失败'))
+      }
+
+      if (job.status === 'cancelled') {
+        events.close()
+        state.activeEventSource = null
+        reject(new Error('已停止处理'))
+      }
+    }
+
+    events.onerror = () => {
+      events.close()
+      state.activeEventSource = null
+      reject(new Error(state.didCancel ? '已停止处理' : '进度连接中断'))
+    }
+  })
+}
+
+function renderRemoteJobProgress(job) {
+  renderProgress(job.progress || 0, `${job.progress || 0}%`)
+
+  if (job.status === 'downloading') {
+    const total = job.totalBytes ? formatBytes(job.totalBytes) : '未知大小'
+    refs.statusText.textContent = `服务器下载 ${formatBytes(job.downloadedBytes)} / ${total}`
+    return
+  }
+
+  if (job.status === 'probing') {
+    refs.statusText.textContent = '读取视频信息'
+    return
+  }
+
+  if (job.status === 'transcoding') {
+    const current = formatDuration(job.transcodedSeconds || 0)
+    const total = job.durationSeconds ? formatDuration(job.durationSeconds) : '未知时长'
+    refs.statusText.textContent = `服务器转码 ${current} / ${total}`
+    return
+  }
+
+  refs.statusText.textContent = job.phase || '处理中'
+}
+
+function downloadRemoteJob(jobId) {
   return new Promise((resolvePromise, reject) => {
     const request = new XMLHttpRequest()
     state.activeRequest = request
-    request.open('POST', '/api/convert-url')
-    request.setRequestHeader('Content-Type', 'application/json')
+    request.open('GET', `/api/url-jobs/${jobId}/download`)
     request.responseType = 'blob'
 
     request.onload = async () => {
@@ -286,10 +369,7 @@ function requestRemoteConversion(codec) {
       reject(new Error('已停止处理'))
     }
 
-    request.send(JSON.stringify({
-      codec,
-      url: state.videoUrl
-    }))
+    request.send()
   })
 }
 
@@ -420,10 +500,16 @@ function cancelActiveRequest() {
   state.didCancel = true
   refs.statusText.textContent = '正在停止'
   refs.cancelBtn.disabled = true
+  state.activeEventSource?.close()
+  state.activeEventSource = null
   state.activeRequest?.abort()
 
   if (state.activeUploadId) {
     fetch(`/api/uploads/${state.activeUploadId}`, { method: 'DELETE' }).catch(() => {})
+  }
+
+  if (state.activeJobId) {
+    fetch(`/api/url-jobs/${state.activeJobId}`, { method: 'DELETE' }).catch(() => {})
   }
 }
 
@@ -431,7 +517,10 @@ function finishRequest() {
   state.isWorking = false
   state.activeRequest = null
   state.activeUploadId = ''
-  refs.convertBtn.disabled = !state.file
+  state.activeJobId = ''
+  state.activeEventSource?.close()
+  state.activeEventSource = null
+  refs.convertBtn.disabled = !(state.file || state.videoUrl)
   refs.cancelBtn.disabled = false
   refs.cancelBtn.classList.add('hidden')
 }
@@ -490,4 +579,11 @@ function formatBytes(bytes) {
   const units = ['B', 'KB', 'MB', 'GB']
   const index = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1)
   return `${(bytes / 1024 ** index).toFixed(index ? 1 : 0)} ${units[index]}`
+}
+
+function formatDuration(seconds) {
+  const safeSeconds = Math.max(0, Math.floor(seconds || 0))
+  const minutes = Math.floor(safeSeconds / 60)
+  const restSeconds = safeSeconds % 60
+  return `${minutes}:${String(restSeconds).padStart(2, '0')}`
 }

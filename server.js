@@ -12,11 +12,13 @@ const HOST = process.env.HOST || '0.0.0.0'
 const DIST_DIR = resolve('dist')
 const TMP_DIR = resolve(process.env.UPLOAD_DIR || 'tmp')
 const FFMPEG_BIN = process.env.FFMPEG_PATH || 'ffmpeg'
+const FFPROBE_BIN = process.env.FFPROBE_PATH || 'ffprobe'
 const MAX_UPLOAD_MB = Number(process.env.MAX_UPLOAD_MB || 2048)
 const CHUNK_UPLOAD_MB = Number(process.env.CHUNK_UPLOAD_MB || 16)
 const TMP_FILE_MAX_AGE_MS = Number(process.env.TMP_FILE_MAX_AGE_MIN || 30) * 60 * 1000
 const UPLOAD_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 const PRIVATE_HOSTS = new Set(['localhost', '127.0.0.1', '0.0.0.0', '::1'])
+const urlJobs = new Map()
 
 const CODECS = {
   h264: {
@@ -331,6 +333,116 @@ app.post('/api/convert-url', async (request, response) => {
   }
 })
 
+app.post('/api/url-jobs', async (request, response) => {
+  const codecName = request.body?.codec
+  const codec = CODECS[codecName]
+  const remoteUrl = String(request.body?.url || '').trim()
+
+  if (!codec) {
+    response.status(400).json({ error: '目标编码不支持' })
+    return
+  }
+
+  let parsedUrl
+  try {
+    parsedUrl = validateRemoteUrl(remoteUrl)
+  } catch (error) {
+    response.status(400).json({ error: error.message })
+    return
+  }
+
+  const jobId = randomUUID()
+  const jobDir = join(TMP_DIR, jobId)
+  const controller = new AbortController()
+  const originalName = getFilenameFromUrl(parsedUrl) || 'video'
+  const job = {
+    id: jobId,
+    status: 'queued',
+    phase: '准备下载',
+    downloadedBytes: 0,
+    totalBytes: 0,
+    transcodedSeconds: 0,
+    durationSeconds: 0,
+    progress: 0,
+    error: '',
+    outputPath: join(jobDir, `output.${codec.extension}`),
+    outputName: `${sanitizeName(removeExtension(originalName)) || 'video'}-${codecName}.${codec.extension}`,
+    mime: codec.mime,
+    jobDir,
+    controller,
+    updatedAt: Date.now()
+  }
+
+  urlJobs.set(jobId, job)
+  response.status(202).json({ jobId })
+
+  runUrlJob(job, parsedUrl, codec).catch((error) => {
+    if (job.status === 'cancelled') return
+    updateJob(job, {
+      status: 'error',
+      phase: '处理失败',
+      error: error.message || '链接下载或转换失败'
+    })
+  })
+})
+
+app.get('/api/url-jobs/:jobId/events', (request, response) => {
+  const job = urlJobs.get(request.params.jobId)
+  if (!job) {
+    response.status(404).end()
+    return
+  }
+
+  response.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    Connection: 'keep-alive'
+  })
+
+  const send = () => {
+    response.write(`data: ${JSON.stringify(publicJob(job))}\n\n`)
+  }
+
+  send()
+  const interval = setInterval(() => {
+    send()
+    if (['done', 'error', 'cancelled'].includes(job.status)) {
+      clearInterval(interval)
+      response.end()
+    }
+  }, 1000)
+
+  request.on('close', () => clearInterval(interval))
+})
+
+app.get('/api/url-jobs/:jobId/download', (request, response) => {
+  const job = urlJobs.get(request.params.jobId)
+  if (!job || job.status !== 'done' || !existsSync(job.outputPath)) {
+    response.status(404).json({ error: '转换结果不存在' })
+    return
+  }
+
+  response.setHeader('Content-Type', job.mime)
+  response.setHeader('Content-Disposition', contentDisposition(job.outputName))
+  response.setHeader('Cache-Control', 'no-store')
+  createReadStream(job.outputPath).pipe(response)
+  response.on('finish', () => cleanupUrlJob(job.id))
+  response.on('close', () => cleanupUrlJob(job.id))
+})
+
+app.delete('/api/url-jobs/:jobId', async (request, response) => {
+  const job = urlJobs.get(request.params.jobId)
+  if (!job) {
+    response.status(204).end()
+    return
+  }
+
+  updateJob(job, { status: 'cancelled', phase: '已停止' })
+  job.controller.abort()
+  await cleanupUrlJob(job.id)
+  response.status(204).end()
+})
+
 app.post('/api/convert', upload.single('video'), async (request, response) => {
   const file = request.file
   const codecName = request.body?.codec
@@ -415,7 +527,7 @@ app.listen(PORT, HOST, () => {
   console.log(`Video codec converter is running at http://${HOST}:${PORT}`)
 })
 
-function runFFmpeg(args, signal) {
+function runFFmpeg(args, signal, onProgress) {
   return new Promise((resolvePromise, reject) => {
     const process = spawn(FFMPEG_BIN, args)
     const logs = []
@@ -437,8 +549,10 @@ function runFFmpeg(args, signal) {
     }, { once: true })
 
     process.stderr.on('data', (data) => {
-      logs.push(data.toString())
+      const text = data.toString()
+      logs.push(text)
       if (logs.length > 30) logs.shift()
+      parseFFmpegProgress(text, onProgress)
     })
 
     process.on('error', (error) => {
@@ -460,6 +574,35 @@ function runFFmpeg(args, signal) {
 
       reject(new Error(`FFmpeg 转换失败：${logs.join('').trim()}`))
     })
+  })
+}
+
+function runFFprobeDuration(filePath, signal) {
+  return new Promise((resolvePromise) => {
+    const process = spawn(FFPROBE_BIN, [
+      '-v',
+      'error',
+      '-show_entries',
+      'format=duration',
+      '-of',
+      'default=noprint_wrappers=1:nokey=1',
+      filePath
+    ])
+    const chunks = []
+
+    if (signal?.aborted) {
+      process.kill('SIGTERM')
+      resolvePromise(0)
+      return
+    }
+
+    signal?.addEventListener('abort', () => process.kill('SIGTERM'), { once: true })
+    process.stdout.on('data', (data) => chunks.push(data.toString()))
+    process.on('close', () => {
+      const duration = Number(chunks.join('').trim())
+      resolvePromise(Number.isFinite(duration) ? duration : 0)
+    })
+    process.on('error', () => resolvePromise(0))
   })
 }
 
@@ -507,6 +650,85 @@ async function cleanupStaleTempFiles() {
   } catch (error) {
     console.warn(`[tmp] cleanup failed: ${error.message}`)
   }
+}
+
+async function runUrlJob(job, parsedUrl, codec) {
+  const inputPath = join(job.jobDir, 'input')
+
+  try {
+    await mkdir(job.jobDir, { recursive: true })
+    updateJob(job, { status: 'downloading', phase: '下载视频', progress: 2 })
+
+    await downloadRemoteVideo(parsedUrl, inputPath, job.controller.signal, ({ downloadedBytes, totalBytes }) => {
+      const downloadProgress = totalBytes ? downloadedBytes / totalBytes : 0
+      updateJob(job, {
+        status: 'downloading',
+        phase: '下载视频',
+        downloadedBytes,
+        totalBytes,
+        progress: totalBytes ? Math.min(35, Math.round(downloadProgress * 35)) : 10
+      })
+    })
+
+    updateJob(job, { status: 'probing', phase: '读取视频信息', progress: 38 })
+    const durationSeconds = await runFFprobeDuration(inputPath, job.controller.signal)
+    updateJob(job, {
+      status: 'transcoding',
+      phase: '服务器转码',
+      durationSeconds,
+      progress: 42
+    })
+
+    await runFFmpeg(['-hide_banner', '-y', '-i', inputPath, ...codec.args, job.outputPath], job.controller.signal, (seconds) => {
+      const transcodeProgress = durationSeconds ? seconds / durationSeconds : 0
+      updateJob(job, {
+        status: 'transcoding',
+        phase: '服务器转码',
+        transcodedSeconds: seconds,
+        progress: durationSeconds ? Math.min(95, 42 + Math.round(transcodeProgress * 53)) : 60
+      })
+    })
+
+    updateJob(job, {
+      status: 'done',
+      phase: '转换完成',
+      transcodedSeconds: durationSeconds || job.transcodedSeconds,
+      progress: 100
+    })
+  } catch (error) {
+    await cleanupFiles(job.jobDir)
+    if (job.controller.signal.aborted || job.status === 'cancelled') {
+      updateJob(job, { status: 'cancelled', phase: '已停止', error: '' })
+      return
+    }
+
+    throw error
+  }
+}
+
+function updateJob(job, patch) {
+  Object.assign(job, patch, { updatedAt: Date.now() })
+}
+
+function publicJob(job) {
+  return {
+    id: job.id,
+    status: job.status,
+    phase: job.phase,
+    downloadedBytes: job.downloadedBytes,
+    totalBytes: job.totalBytes,
+    transcodedSeconds: job.transcodedSeconds,
+    durationSeconds: job.durationSeconds,
+    progress: job.progress,
+    error: job.error
+  }
+}
+
+async function cleanupUrlJob(jobId) {
+  const job = urlJobs.get(jobId)
+  if (!job) return
+  urlJobs.delete(jobId)
+  await cleanupFiles(job.jobDir)
 }
 
 function contentDisposition(filename) {
@@ -572,7 +794,7 @@ function getFilenameFromUrl(url) {
   return filename || 'video'
 }
 
-async function downloadRemoteVideo(url, filePath, signal) {
+async function downloadRemoteVideo(url, filePath, signal, onProgress) {
   const response = await fetch(url, {
     signal,
     redirect: 'follow',
@@ -595,10 +817,13 @@ async function downloadRemoteVideo(url, filePath, signal) {
     throw new Error('下载失败：响应内容为空')
   }
 
-  await writeResponseBody(response.body, filePath, maxBytes, signal)
+  await writeResponseBody(response.body, filePath, maxBytes, signal, {
+    totalBytes: contentLength,
+    onProgress
+  })
 }
 
-function writeResponseBody(body, filePath, maxBytes, signal) {
+function writeResponseBody(body, filePath, maxBytes, signal, options = {}) {
   return new Promise((resolvePromise, reject) => {
     const reader = body.getReader()
     const writeStream = createWriteStream(filePath)
@@ -639,6 +864,11 @@ function writeResponseBody(body, filePath, maxBytes, signal) {
           }
 
           downloadedBytes += value.byteLength
+          options.onProgress?.({
+            downloadedBytes,
+            totalBytes: options.totalBytes || 0
+          })
+
           if (downloadedBytes > maxBytes) {
             await reader.cancel()
             finish(new Error(`文件太大，最大支持 ${MAX_UPLOAD_MB} MB`))
@@ -658,6 +888,19 @@ function writeResponseBody(body, filePath, maxBytes, signal) {
     signal?.addEventListener('abort', abort, { once: true })
     pump()
   })
+}
+
+function parseFFmpegProgress(text, onProgress) {
+  if (!onProgress) return
+
+  const matches = text.matchAll(/time=(\d{2}):(\d{2}):(\d{2}(?:\.\d+)?)/g)
+  for (const match of matches) {
+    const hours = Number(match[1])
+    const minutes = Number(match[2])
+    const seconds = Number(match[3])
+    const totalSeconds = hours * 3600 + minutes * 60 + seconds
+    if (Number.isFinite(totalSeconds)) onProgress(totalSeconds)
+  }
 }
 
 function isValidUploadId(uploadId) {
