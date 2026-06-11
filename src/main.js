@@ -1,45 +1,18 @@
-import { FFmpeg } from '@ffmpeg/ffmpeg'
-import { fetchFile, toBlobURL } from '@ffmpeg/util'
 import './styles.css'
 
-const CORE_VERSION = '0.12.10'
-const CORE_BASE_URL = `https://cdn.jsdelivr.net/npm/@ffmpeg/core@${CORE_VERSION}/dist/esm`
-
 const CODECS = {
-  h264: {
-    label: 'H.264 / AVC',
-    extension: 'mp4',
-    mime: 'video/mp4',
-    args: ['-c:v', 'libx264', '-crf', '23', '-preset', 'veryfast', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-b:a', '160k', '-movflags', 'faststart']
-  },
-  h265: {
-    label: 'H.265 / HEVC',
-    extension: 'mp4',
-    mime: 'video/mp4',
-    args: ['-c:v', 'libx265', '-crf', '28', '-preset', 'fast', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-b:a', '160k', '-movflags', 'faststart']
-  },
-  vp9: {
-    label: 'VP9',
-    extension: 'webm',
-    mime: 'video/webm',
-    args: ['-c:v', 'libvpx-vp9', '-crf', '32', '-b:v', '0', '-c:a', 'libopus', '-b:a', '128k']
-  },
-  mpeg4: {
-    label: 'MPEG-4 Part 2',
-    extension: 'mp4',
-    mime: 'video/mp4',
-    args: ['-c:v', 'mpeg4', '-q:v', '5', '-c:a', 'aac', '-b:a', '160k', '-movflags', 'faststart']
-  }
+  h264: 'H.264 / AVC',
+  h265: 'H.265 / HEVC',
+  vp9: 'VP9',
+  mpeg4: 'MPEG-4 Part 2'
 }
 
 const app = document.querySelector('#app')
-const ffmpeg = new FFmpeg()
 
 const state = {
   file: null,
   inputUrl: '',
   outputUrl: '',
-  isLoaded: false,
   isWorking: false
 }
 
@@ -51,7 +24,7 @@ app.innerHTML = `
           <div class="brand-mark">FF</div>
           <div>
             <h1>视频编码转换器</h1>
-            <p>只转换视频编码</p>
+            <p>服务器端 FFmpeg 转码</p>
           </div>
         </div>
 
@@ -75,7 +48,7 @@ app.innerHTML = `
         <div class="actions">
           <button id="convertBtn" class="primary" type="button" disabled>
             <span class="button-icon">▶</span>
-            开始转换编码
+            上传并转换
           </button>
           <a id="downloadBtn" class="download hidden" href="#" download>
             <span class="button-icon">↓</span>
@@ -100,7 +73,7 @@ app.innerHTML = `
             <span class="eyebrow">当前状态</span>
             <strong id="statusText">等待文件</strong>
           </div>
-          <div class="progress-shell" aria-label="转换进度">
+          <div id="progressShell" class="progress-shell" aria-label="转换进度">
             <div id="progressBar"></div>
           </div>
           <span id="progressText">0%</span>
@@ -120,13 +93,10 @@ const refs = {
   preview: document.querySelector('#preview'),
   emptyState: document.querySelector('#emptyState'),
   statusText: document.querySelector('#statusText'),
+  progressShell: document.querySelector('#progressShell'),
   progressBar: document.querySelector('#progressBar'),
   progressText: document.querySelector('#progressText')
 }
-
-ffmpeg.on('progress', ({ progress }) => {
-  renderProgress(Math.max(0, Math.min(1, progress || 0)))
-})
 
 refs.fileInput.addEventListener('change', (event) => {
   const [file] = event.target.files
@@ -167,63 +137,77 @@ function setFile(file) {
   renderProgress(0)
 }
 
-async function ensureFFmpegLoaded() {
-  if (state.isLoaded) return
-
-  refs.statusText.textContent = '加载 FFmpeg'
-  refs.convertBtn.disabled = true
-
-  await ffmpeg.load({
-    coreURL: await toBlobURL(`${CORE_BASE_URL}/ffmpeg-core.js`, 'text/javascript'),
-    wasmURL: await toBlobURL(`${CORE_BASE_URL}/ffmpeg-core.wasm`, 'application/wasm')
-  })
-
-  state.isLoaded = true
-}
-
-async function convertVideoCodec() {
+function convertVideoCodec() {
   if (!state.file || state.isWorking) return
 
   cleanupOutput()
   state.isWorking = true
   refs.convertBtn.disabled = true
-  refs.statusText.textContent = '准备转换'
+  refs.statusText.textContent = '上传视频'
   renderProgress(0)
 
-  const codecKey = refs.codecSelect.value
-  const codec = CODECS[codecKey]
-  const inputName = `input.${getExtension(state.file.name) || 'mp4'}`
-  const outputName = `${sanitizeName(removeExtension(state.file.name)) || 'video'}-${codecKey}.${codec.extension}`
+  const codec = refs.codecSelect.value
+  const formData = new FormData()
+  formData.append('video', state.file)
+  formData.append('codec', codec)
 
-  try {
-    await ensureFFmpegLoaded()
+  const request = new XMLHttpRequest()
+  request.open('POST', '/api/convert')
+  request.responseType = 'blob'
 
-    refs.statusText.textContent = `转换为 ${codec.label}`
-    await ffmpeg.writeFile(inputName, await fetchFile(state.file))
-    await ffmpeg.exec(['-y', '-i', inputName, ...codec.args, outputName])
-
-    const data = await ffmpeg.readFile(outputName)
-    state.outputUrl = URL.createObjectURL(new Blob([data], { type: codec.mime }))
-
-    refs.downloadBtn.href = state.outputUrl
-    refs.downloadBtn.download = outputName
-    refs.downloadBtn.classList.remove('hidden')
-    refs.statusText.textContent = '转换完成'
-    renderProgress(1)
-
-    await Promise.allSettled([ffmpeg.deleteFile(inputName), ffmpeg.deleteFile(outputName)])
-  } catch (error) {
-    refs.statusText.textContent = error?.message || '转换失败'
-  } finally {
-    state.isWorking = false
-    refs.convertBtn.disabled = !state.file
+  request.upload.onprogress = (event) => {
+    if (!event.lengthComputable) return
+    const uploadProgress = event.loaded / event.total
+    renderProgress(Math.min(45, Math.round(uploadProgress * 45)))
   }
+
+  request.onloadstart = () => {
+    refs.statusText.textContent = '上传视频'
+  }
+
+  request.onload = async () => {
+    refs.progressShell.classList.remove('is-indeterminate')
+
+    if (request.status < 200 || request.status >= 300) {
+      refs.statusText.textContent = await readError(request.response)
+      finishRequest()
+      return
+    }
+
+    const filename = getFilenameFromDisposition(request.getResponseHeader('Content-Disposition')) || `video-${codec}.mp4`
+    state.outputUrl = URL.createObjectURL(request.response)
+    refs.downloadBtn.href = state.outputUrl
+    refs.downloadBtn.download = filename
+    refs.downloadBtn.classList.remove('hidden')
+    refs.statusText.textContent = `已转换为 ${CODECS[codec]}`
+    renderProgress(100)
+    finishRequest()
+  }
+
+  request.onerror = () => {
+    refs.progressShell.classList.remove('is-indeterminate')
+    refs.statusText.textContent = '网络错误，转换失败'
+    finishRequest()
+  }
+
+  request.upload.onload = () => {
+    refs.statusText.textContent = `服务器转码为 ${CODECS[codec]}`
+    refs.progressShell.classList.add('is-indeterminate')
+    renderProgress(45)
+  }
+
+  request.send(formData)
+}
+
+function finishRequest() {
+  state.isWorking = false
+  refs.convertBtn.disabled = !state.file
 }
 
 function renderProgress(progress) {
-  const percent = Math.round(progress * 100)
+  const percent = Math.max(0, Math.min(100, progress))
   refs.progressBar.style.width = `${percent}%`
-  refs.progressText.textContent = `${percent}%`
+  refs.progressText.textContent = refs.progressShell.classList.contains('is-indeterminate') ? '转码中' : `${percent}%`
 }
 
 function cleanupOutput() {
@@ -231,18 +215,24 @@ function cleanupOutput() {
   state.outputUrl = ''
   refs.downloadBtn.classList.add('hidden')
   refs.downloadBtn.removeAttribute('href')
+  refs.progressShell.classList.remove('is-indeterminate')
 }
 
-function getExtension(name) {
-  return name.includes('.') ? name.split('.').pop().toLowerCase() : ''
+async function readError(blob) {
+  try {
+    const data = JSON.parse(await blob.text())
+    return data.error || '转换失败'
+  } catch {
+    return '转换失败'
+  }
 }
 
-function removeExtension(name) {
-  return name.replace(/\.[^/.]+$/, '')
-}
-
-function sanitizeName(name) {
-  return name.replace(/[^\w.-]+/g, '-').replace(/^-+|-+$/g, '')
+function getFilenameFromDisposition(disposition) {
+  if (!disposition) return ''
+  const utf8Match = disposition.match(/filename\*=UTF-8''([^;]+)/)
+  if (utf8Match) return decodeURIComponent(utf8Match[1])
+  const asciiMatch = disposition.match(/filename="([^"]+)"/)
+  return asciiMatch ? asciiMatch[1] : ''
 }
 
 function formatBytes(bytes) {

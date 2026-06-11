@@ -333,11 +333,26 @@ video.is-visible {
   transition: width 180ms ease;
 }
 
+.progress-shell.is-indeterminate #progressBar {
+  width: 45%;
+  animation: progressPulse 1s ease-in-out infinite alternate;
+}
+
 #progressText {
   color: #4a5868;
   font-variant-numeric: tabular-nums;
   font-weight: 800;
   text-align: right;
+}
+
+@keyframes progressPulse {
+  from {
+    transform: translateX(0);
+  }
+
+  to {
+    transform: translateX(110%);
+  }
 }
 
 .log-panel {

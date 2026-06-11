@@ -1,6 +1,19 @@
 # 部署说明
 
-这个项目是纯前端视频编码转换器，生产环境先构建静态文件，再用 `server.js` 提供服务。
+这个项目是服务端视频编码转换器。浏览器上传视频，Node 服务接收文件后调用服务器本机的 `ffmpeg` 转码，再返回转换后的视频。
+
+服务器需要安装原生 FFmpeg：
+
+```bash
+ffmpeg -version
+```
+
+如果没有安装，Ubuntu/Debian 可以执行：
+
+```bash
+sudo apt update
+sudo apt install -y ffmpeg
+```
 
 ## 直接部署
 
@@ -22,6 +35,16 @@ http://服务器IP:33219/
 PORT=33219 npm start
 ```
 
+可选环境变量：
+
+```bash
+PORT=33219
+HOST=0.0.0.0
+FFMPEG_PATH=ffmpeg
+MAX_UPLOAD_MB=2048
+UPLOAD_DIR=tmp
+```
+
 ## Docker 部署
 
 ```bash
@@ -31,16 +54,14 @@ docker run -d --name video-convert -p 33219:33219 video-convert
 
 ## Nginx 反向代理
 
-如果前面有 Nginx，反代到本服务即可，同时保留下面两个响应头：
+如果前面有 Nginx，反代到本服务即可。大文件上传时建议同步调大 `client_max_body_size`：
 
 ```nginx
+client_max_body_size 2048m;
+
 location / {
   proxy_pass http://127.0.0.1:33219;
   proxy_set_header Host $host;
   proxy_set_header X-Real-IP $remote_addr;
-  add_header Cross-Origin-Opener-Policy same-origin always;
-  add_header Cross-Origin-Embedder-Policy require-corp always;
 }
 ```
-
-这两个 header 是 ffmpeg.wasm 在浏览器里稳定运行需要的。
