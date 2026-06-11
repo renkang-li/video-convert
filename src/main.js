@@ -14,7 +14,9 @@ const state = {
   inputUrl: '',
   outputUrl: '',
   isWorking: false,
-  uploadStartedAt: 0
+  uploadStartedAt: 0,
+  activeRequest: null,
+  didCancel: false
 }
 
 app.innerHTML = `
@@ -50,6 +52,10 @@ app.innerHTML = `
           <button id="convertBtn" class="primary" type="button" disabled>
             <span class="button-icon">▶</span>
             上传并转换
+          </button>
+          <button id="cancelBtn" class="danger hidden" type="button">
+            <span class="button-icon">■</span>
+            停止
           </button>
           <a id="downloadBtn" class="download hidden" href="#" download>
             <span class="button-icon">↓</span>
@@ -90,6 +96,7 @@ const refs = {
   fileMeta: document.querySelector('#fileMeta'),
   codecSelect: document.querySelector('#codecSelect'),
   convertBtn: document.querySelector('#convertBtn'),
+  cancelBtn: document.querySelector('#cancelBtn'),
   downloadBtn: document.querySelector('#downloadBtn'),
   preview: document.querySelector('#preview'),
   emptyState: document.querySelector('#emptyState'),
@@ -121,6 +128,7 @@ refs.dropzone.addEventListener('drop', (event) => {
 })
 
 refs.convertBtn.addEventListener('click', convertVideoCodec)
+refs.cancelBtn.addEventListener('click', cancelActiveRequest)
 
 function setFile(file) {
   cleanupOutput()
@@ -143,8 +151,10 @@ function convertVideoCodec() {
 
   cleanupOutput()
   state.isWorking = true
+  state.didCancel = false
   state.uploadStartedAt = performance.now()
   refs.convertBtn.disabled = true
+  refs.cancelBtn.classList.remove('hidden')
   refs.statusText.textContent = '上传视频'
   renderProgress(0)
 
@@ -154,6 +164,7 @@ function convertVideoCodec() {
   formData.append('codec', codec)
 
   const request = new XMLHttpRequest()
+  state.activeRequest = request
   request.open('POST', '/api/convert')
   request.responseType = 'blob'
 
@@ -193,7 +204,21 @@ function convertVideoCodec() {
 
   request.onerror = () => {
     refs.progressShell.classList.remove('is-indeterminate')
+    if (state.didCancel) {
+      refs.statusText.textContent = '已停止上传并清理'
+      renderProgress(0)
+      finishRequest()
+      return
+    }
+
     refs.statusText.textContent = '网络错误，转换失败'
+    finishRequest()
+  }
+
+  request.onabort = () => {
+    refs.progressShell.classList.remove('is-indeterminate')
+    refs.statusText.textContent = '已停止上传并清理'
+    renderProgress(0)
     finishRequest()
   }
 
@@ -206,9 +231,21 @@ function convertVideoCodec() {
   request.send(formData)
 }
 
+function cancelActiveRequest() {
+  if (!state.activeRequest || !state.isWorking) return
+
+  state.didCancel = true
+  refs.statusText.textContent = '正在停止'
+  refs.cancelBtn.disabled = true
+  state.activeRequest.abort()
+}
+
 function finishRequest() {
   state.isWorking = false
+  state.activeRequest = null
   refs.convertBtn.disabled = !state.file
+  refs.cancelBtn.disabled = false
+  refs.cancelBtn.classList.add('hidden')
 }
 
 function renderProgress(progress, label = '') {

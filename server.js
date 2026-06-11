@@ -57,8 +57,20 @@ const MIME_TYPES = {
 const app = express()
 app.disable('x-powered-by')
 
+const storage = multer.diskStorage({
+  destination(request, file, callback) {
+    callback(null, TMP_DIR)
+  },
+  filename(request, file, callback) {
+    const filename = randomUUID()
+    const filePath = join(TMP_DIR, filename)
+    request.uploadTempPaths = [...(request.uploadTempPaths || []), filePath]
+    callback(null, filename)
+  }
+})
+
 const upload = multer({
-  dest: TMP_DIR,
+  storage,
   limits: {
     fileSize: MAX_UPLOAD_MB * 1024 * 1024,
     files: 1
@@ -88,12 +100,14 @@ app.use('/api/convert', (request, response, next) => {
   request.on('aborted', () => {
     const durationSeconds = ((Date.now() - startedAt) / 1000).toFixed(2)
     console.warn(`[convert] aborted duration=${durationSeconds}s request=${formatBytes(uploadSize)}`)
+    setTimeout(() => cleanupFiles(...(request.uploadTempPaths || [])), 1000).unref()
   })
 
   response.on('close', () => {
     if (finished) return
     const durationSeconds = ((Date.now() - startedAt) / 1000).toFixed(2)
-    console.warn(`[convert] closed status=${response.statusCode} duration=${durationSeconds}s request=${formatBytes(uploadSize)}`)
+    console.warn(`[convert] closed duration=${durationSeconds}s request=${formatBytes(uploadSize)}`)
+    setTimeout(() => cleanupFiles(...(request.uploadTempPaths || [])), 1000).unref()
   })
 
   next()
@@ -103,6 +117,10 @@ app.post('/api/convert', upload.single('video'), async (request, response) => {
   const file = request.file
   const codecName = request.body?.codec
   const codec = CODECS[codecName]
+  const abortController = new AbortController()
+  response.on('close', () => {
+    if (!response.writableEnded) abortController.abort()
+  })
 
   if (!file) {
     response.status(400).json({ error: '请选择视频文件' })
@@ -116,10 +134,16 @@ app.post('/api/convert', upload.single('video'), async (request, response) => {
   }
 
   const outputPath = join(TMP_DIR, `${randomUUID()}.${codec.extension}`)
+  request.uploadTempPaths = [...(request.uploadTempPaths || []), outputPath]
   const outputName = `${sanitizeName(removeExtension(file.originalname)) || 'video'}-${codecName}.${codec.extension}`
 
   try {
-    await runFFmpeg(['-hide_banner', '-y', '-i', file.path, ...codec.args, outputPath])
+    await runFFmpeg(['-hide_banner', '-y', '-i', file.path, ...codec.args, outputPath], abortController.signal)
+
+    if (abortController.signal.aborted || response.destroyed) {
+      await cleanupFiles(file.path, outputPath)
+      return
+    }
 
     response.setHeader('Content-Type', codec.mime)
     response.setHeader('Content-Disposition', contentDisposition(outputName))
@@ -129,6 +153,7 @@ app.post('/api/convert', upload.single('video'), async (request, response) => {
     response.on('close', () => cleanupFiles(file.path, outputPath))
   } catch (error) {
     await cleanupFiles(file.path, outputPath)
+    if (abortController.signal.aborted || response.destroyed) return
     response.status(500).json({ error: error.message || '转换失败' })
   }
 })
@@ -149,6 +174,12 @@ app.use((request, response, next) => {
 })
 
 app.use((error, request, response, next) => {
+  cleanupFiles(...(request.uploadTempPaths || []))
+
+  if (request.aborted || response.destroyed) {
+    return
+  }
+
   if (response.headersSent) {
     next(error)
     return
@@ -166,10 +197,26 @@ app.listen(PORT, HOST, () => {
   console.log(`Video codec converter is running at http://${HOST}:${PORT}`)
 })
 
-function runFFmpeg(args) {
+function runFFmpeg(args, signal) {
   return new Promise((resolvePromise, reject) => {
     const process = spawn(FFMPEG_BIN, args)
     const logs = []
+    let didAbort = false
+    let didClose = false
+
+    if (signal?.aborted) {
+      process.kill('SIGTERM')
+      reject(new Error('转换已停止'))
+      return
+    }
+
+    signal?.addEventListener('abort', () => {
+      didAbort = true
+      process.kill('SIGTERM')
+      setTimeout(() => {
+        if (!didClose) process.kill('SIGKILL')
+      }, 3000).unref()
+    }, { once: true })
 
     process.stderr.on('data', (data) => {
       logs.push(data.toString())
@@ -181,6 +228,13 @@ function runFFmpeg(args) {
     })
 
     process.on('close', (code) => {
+      didClose = true
+
+      if (didAbort || signal?.aborted) {
+        reject(new Error('转换已停止'))
+        return
+      }
+
       if (code === 0) {
         resolvePromise()
         return

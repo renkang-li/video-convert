@@ -237,6 +237,21 @@ button,
   background: #c4392f;
 }
 
+.danger {
+  color: #fff;
+  background: #8f2f2a;
+  cursor: pointer;
+}
+
+.danger:hover:not(:disabled) {
+  background: #742521;
+}
+
+.danger:disabled {
+  cursor: wait;
+  opacity: 0.62;
+}
+
 .button-icon {
   margin-right: 8px;
 }
