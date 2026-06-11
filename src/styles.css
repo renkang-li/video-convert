@@ -183,20 +183,44 @@ p {
 }
 
 .drop-icon {
-  display: grid;
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
   width: 52px;
   height: 52px;
-  place-items: center;
   border-radius: var(--radius-full);
-  color: #fff;
+  color: transparent; /* Hide the original text '+' */
   background: rgba(255, 255, 255, 0.05);
   backdrop-filter: blur(8px);
   border: 1px solid rgba(255, 255, 255, 0.1);
-  font-size: 28px;
-  font-weight: 300;
-  line-height: 1;
   transition: all 0.4s cubic-bezier(0.34, 1.56, 0.64, 1);
   box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
+}
+
+/* Draw a pixel-perfect plus sign using pseudo-elements */
+.drop-icon::before,
+.drop-icon::after {
+  content: '';
+  position: absolute;
+  background-color: #fff;
+  border-radius: 2px;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  transition: all 0.4s cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+
+/* Horizontal line of the plus */
+.drop-icon::before {
+  width: 20px;
+  height: 2px;
+}
+
+/* Vertical line of the plus */
+.drop-icon::after {
+  width: 2px;
+  height: 20px;
 }
 
 .dropzone:hover .drop-icon {
@@ -205,6 +229,7 @@ p {
   border-color: transparent;
   box-shadow: 0 8px 24px rgba(99, 102, 241, 0.4);
 }
+
 
 .dropzone strong {
   font-size: 16px;
