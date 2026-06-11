@@ -169,6 +169,20 @@ select {
   background: #fff;
 }
 
+.url-input {
+  width: 100%;
+  min-height: 44px;
+  padding: 0 12px;
+  border: 1px solid rgba(24, 33, 47, 0.16);
+  border-radius: 8px;
+  color: #18212f;
+  background: #fff;
+}
+
+.url-input::placeholder {
+  color: #98a2ad;
+}
+
 .toggle-row {
   display: flex;
   align-items: center;

@@ -13,6 +13,7 @@ const app = document.querySelector('#app')
 
 const state = {
   file: null,
+  videoUrl: '',
   inputUrl: '',
   outputUrl: '',
   isWorking: false,
@@ -39,6 +40,11 @@ app.innerHTML = `
           <span class="drop-icon">+</span>
           <strong>选择或拖入视频</strong>
           <small id="fileMeta">等待选择视频文件</small>
+        </label>
+
+        <label>
+          <span>视频链接</span>
+          <input id="urlInput" class="url-input" type="url" placeholder="https://example.com/video.mp4" />
         </label>
 
         <label>
@@ -95,6 +101,7 @@ app.innerHTML = `
 
 const refs = {
   fileInput: document.querySelector('#fileInput'),
+  urlInput: document.querySelector('#urlInput'),
   dropzone: document.querySelector('#dropzone'),
   fileMeta: document.querySelector('#fileMeta'),
   codecSelect: document.querySelector('#codecSelect'),
@@ -112,6 +119,10 @@ const refs = {
 refs.fileInput.addEventListener('change', (event) => {
   const [file] = event.target.files
   if (file) setFile(file)
+})
+
+refs.urlInput.addEventListener('input', (event) => {
+  setVideoUrl(event.target.value)
 })
 
 refs.dropzone.addEventListener('dragover', (event) => {
@@ -138,19 +149,46 @@ function setFile(file) {
   if (state.inputUrl) URL.revokeObjectURL(state.inputUrl)
 
   state.file = file
+  state.videoUrl = ''
   state.inputUrl = URL.createObjectURL(file)
+  refs.urlInput.value = ''
 
   refs.preview.src = state.inputUrl
   refs.preview.classList.add('is-visible')
   refs.emptyState.classList.add('hidden')
   refs.fileMeta.textContent = `${file.name} · ${formatBytes(file.size)}`
   refs.statusText.textContent = '已选择文件'
+  refs.convertBtn.textContent = '上传并转换'
+  refs.convertBtn.disabled = false
+  renderProgress(0)
+}
+
+function setVideoUrl(value) {
+  cleanupOutput()
+  const videoUrl = value.trim()
+  state.videoUrl = videoUrl
+
+  if (!videoUrl) {
+    refs.convertBtn.disabled = !state.file
+    refs.statusText.textContent = state.file ? '已选择文件' : '等待文件'
+    refs.convertBtn.textContent = '上传并转换'
+    return
+  }
+
+  state.file = null
+  refs.fileInput.value = ''
+  refs.fileMeta.textContent = '使用视频链接'
+  refs.preview.removeAttribute('src')
+  refs.preview.classList.remove('is-visible')
+  refs.emptyState.classList.remove('hidden')
+  refs.statusText.textContent = '已输入视频链接'
+  refs.convertBtn.textContent = '下载并转换'
   refs.convertBtn.disabled = false
   renderProgress(0)
 }
 
 async function convertVideoCodec() {
-  if (!state.file || state.isWorking) return
+  if ((!state.file && !state.videoUrl) || state.isWorking) return
 
   cleanupOutput()
   state.isWorking = true
@@ -158,11 +196,17 @@ async function convertVideoCodec() {
   state.uploadStartedAt = performance.now()
   refs.convertBtn.disabled = true
   refs.cancelBtn.classList.remove('hidden')
-  refs.statusText.textContent = '上传视频'
+  refs.statusText.textContent = state.videoUrl ? '服务器下载视频' : '上传视频'
   renderProgress(0)
 
   try {
     const codec = refs.codecSelect.value
+
+    if (state.videoUrl) {
+      await convertRemoteVideo(codec)
+      return
+    }
+
     const { uploadId } = await createUploadSession()
     state.activeUploadId = uploadId
 
@@ -193,6 +237,60 @@ async function convertVideoCodec() {
   } finally {
     finishRequest()
   }
+}
+
+async function convertRemoteVideo(codec) {
+  refs.progressShell.classList.add('is-indeterminate')
+  refs.statusText.textContent = '服务器下载并转码'
+  renderProgress(35, '处理中')
+
+  const result = await requestRemoteConversion(codec)
+  const filename = getFilenameFromDisposition(result.disposition) || `video-${codec}.mp4`
+  state.outputUrl = URL.createObjectURL(result.blob)
+  refs.downloadBtn.href = state.outputUrl
+  refs.downloadBtn.download = filename
+  refs.downloadBtn.classList.remove('hidden')
+  refs.statusText.textContent = `已转换为 ${CODECS[codec]}`
+  refs.progressShell.classList.remove('is-indeterminate')
+  renderProgress(100)
+}
+
+function requestRemoteConversion(codec) {
+  return new Promise((resolvePromise, reject) => {
+    const request = new XMLHttpRequest()
+    state.activeRequest = request
+    request.open('POST', '/api/convert-url')
+    request.setRequestHeader('Content-Type', 'application/json')
+    request.responseType = 'blob'
+
+    request.onload = async () => {
+      state.activeRequest = null
+      if (request.status >= 200 && request.status < 300) {
+        resolvePromise({
+          blob: request.response,
+          disposition: request.getResponseHeader('Content-Disposition')
+        })
+        return
+      }
+
+      reject(new Error(await readError(request.response)))
+    }
+
+    request.onerror = () => {
+      state.activeRequest = null
+      reject(new Error(state.didCancel ? '已停止处理' : '网络错误，转换失败'))
+    }
+
+    request.onabort = () => {
+      state.activeRequest = null
+      reject(new Error('已停止处理'))
+    }
+
+    request.send(JSON.stringify({
+      codec,
+      url: state.videoUrl
+    }))
+  })
 }
 
 async function createUploadSession() {

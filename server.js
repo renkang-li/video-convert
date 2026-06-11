@@ -2,6 +2,7 @@ import { createReadStream, createWriteStream, existsSync, statSync } from 'node:
 import { mkdir, readdir, rm, stat } from 'node:fs/promises'
 import { randomUUID } from 'node:crypto'
 import { spawn } from 'node:child_process'
+import { isIP } from 'node:net'
 import { extname, join, resolve } from 'node:path'
 import express from 'express'
 import multer from 'multer'
@@ -15,6 +16,7 @@ const MAX_UPLOAD_MB = Number(process.env.MAX_UPLOAD_MB || 2048)
 const CHUNK_UPLOAD_MB = Number(process.env.CHUNK_UPLOAD_MB || 16)
 const TMP_FILE_MAX_AGE_MS = Number(process.env.TMP_FILE_MAX_AGE_MIN || 30) * 60 * 1000
 const UPLOAD_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+const PRIVATE_HOSTS = new Set(['localhost', '127.0.0.1', '0.0.0.0', '::1'])
 
 const CODECS = {
   h264: {
@@ -174,6 +176,26 @@ app.use('/api/uploads', (request, response, next) => {
   next()
 })
 
+app.use('/api/convert-url', (request, response, next) => {
+  const startedAt = Date.now()
+  let finished = false
+
+  response.on('finish', () => {
+    finished = true
+    const durationSeconds = ((Date.now() - startedAt) / 1000).toFixed(2)
+    console.log(`[url] status=${response.statusCode} duration=${durationSeconds}s`)
+  })
+
+  response.on('close', () => {
+    if (finished) return
+    const durationSeconds = ((Date.now() - startedAt) / 1000).toFixed(2)
+    console.warn(`[url] closed duration=${durationSeconds}s`)
+    setTimeout(() => cleanupFiles(...(request.uploadTempPaths || [])), 1000).unref()
+  })
+
+  next()
+})
+
 app.post('/api/uploads', async (request, response) => {
   const uploadId = randomUUID()
   await mkdir(getChunkDir(uploadId), { recursive: true })
@@ -254,6 +276,59 @@ app.delete('/api/uploads/:uploadId', async (request, response) => {
 
   await cleanupFiles(getUploadDir(uploadId))
   response.status(204).end()
+})
+
+app.post('/api/convert-url', async (request, response) => {
+  const codecName = request.body?.codec
+  const codec = CODECS[codecName]
+  const remoteUrl = String(request.body?.url || '').trim()
+
+  if (!codec) {
+    response.status(400).json({ error: '目标编码不支持' })
+    return
+  }
+
+  let parsedUrl
+  try {
+    parsedUrl = validateRemoteUrl(remoteUrl)
+  } catch (error) {
+    response.status(400).json({ error: error.message })
+    return
+  }
+
+  const jobDir = join(TMP_DIR, randomUUID())
+  const inputPath = join(jobDir, 'input')
+  const outputPath = join(jobDir, `output.${codec.extension}`)
+  const originalName = getFilenameFromUrl(parsedUrl) || 'video'
+  const outputName = `${sanitizeName(removeExtension(originalName)) || 'video'}-${codecName}.${codec.extension}`
+  const abortController = new AbortController()
+  request.uploadTempPaths = [jobDir]
+
+  response.on('close', () => {
+    if (!response.writableEnded) abortController.abort()
+  })
+
+  try {
+    await mkdir(jobDir, { recursive: true })
+    await downloadRemoteVideo(parsedUrl, inputPath, abortController.signal)
+    await runFFmpeg(['-hide_banner', '-y', '-i', inputPath, ...codec.args, outputPath], abortController.signal)
+
+    if (abortController.signal.aborted || response.destroyed) {
+      await cleanupFiles(jobDir)
+      return
+    }
+
+    response.setHeader('Content-Type', codec.mime)
+    response.setHeader('Content-Disposition', contentDisposition(outputName))
+    response.setHeader('Cache-Control', 'no-store')
+    createReadStream(outputPath).pipe(response)
+    response.on('finish', () => cleanupFiles(jobDir))
+    response.on('close', () => cleanupFiles(jobDir))
+  } catch (error) {
+    await cleanupFiles(jobDir)
+    if (abortController.signal.aborted || response.destroyed) return
+    response.status(500).json({ error: error.message || '链接下载或转换失败' })
+  }
 })
 
 app.post('/api/convert', upload.single('video'), async (request, response) => {
@@ -445,6 +520,144 @@ function removeExtension(name) {
 
 function sanitizeName(name) {
   return name.replace(/[^\w.-]+/g, '-').replace(/^-+|-+$/g, '')
+}
+
+function validateRemoteUrl(value) {
+  if (!value) throw new Error('请输入视频链接')
+
+  let parsedUrl
+  try {
+    parsedUrl = new URL(value)
+  } catch {
+    throw new Error('视频链接格式无效')
+  }
+
+  if (!['http:', 'https:'].includes(parsedUrl.protocol)) {
+    throw new Error('只支持 HTTP 或 HTTPS 链接')
+  }
+
+  const hostname = parsedUrl.hostname.toLowerCase()
+  if (PRIVATE_HOSTS.has(hostname)) {
+    throw new Error('不支持本机或内网地址')
+  }
+
+  if (isPrivateIp(hostname)) {
+    throw new Error('不支持内网 IP 地址')
+  }
+
+  return parsedUrl
+}
+
+function isPrivateIp(hostname) {
+  const version = isIP(hostname)
+  if (!version) return false
+
+  if (version === 4) {
+    const [a, b] = hostname.split('.').map(Number)
+    return (
+      a === 10 ||
+      a === 127 ||
+      (a === 172 && b >= 16 && b <= 31) ||
+      (a === 192 && b === 168) ||
+      (a === 169 && b === 254)
+    )
+  }
+
+  return hostname === '::1' || hostname.startsWith('fc') || hostname.startsWith('fd') || hostname.startsWith('fe80')
+}
+
+function getFilenameFromUrl(url) {
+  const pathname = decodeURIComponent(url.pathname)
+  const filename = pathname.split('/').filter(Boolean).pop()
+  return filename || 'video'
+}
+
+async function downloadRemoteVideo(url, filePath, signal) {
+  const response = await fetch(url, {
+    signal,
+    redirect: 'follow',
+    headers: {
+      'User-Agent': 'video-convert/1.0'
+    }
+  })
+
+  if (!response.ok) {
+    throw new Error(`下载失败：HTTP ${response.status}`)
+  }
+
+  const contentLength = Number(response.headers.get('content-length') || 0)
+  const maxBytes = MAX_UPLOAD_MB * 1024 * 1024
+  if (contentLength > maxBytes) {
+    throw new Error(`文件太大，最大支持 ${MAX_UPLOAD_MB} MB`)
+  }
+
+  if (!response.body) {
+    throw new Error('下载失败：响应内容为空')
+  }
+
+  await writeResponseBody(response.body, filePath, maxBytes, signal)
+}
+
+function writeResponseBody(body, filePath, maxBytes, signal) {
+  return new Promise((resolvePromise, reject) => {
+    const reader = body.getReader()
+    const writeStream = createWriteStream(filePath)
+    let downloadedBytes = 0
+    let settled = false
+
+    function finish(error) {
+      if (settled) return
+      settled = true
+      signal?.removeEventListener('abort', abort)
+
+      if (error) {
+        writeStream.destroy()
+        reject(error)
+        return
+      }
+
+      writeStream.end(resolvePromise)
+    }
+
+    function abort() {
+      reader.cancel().catch(() => {})
+      finish(new Error('下载已停止'))
+    }
+
+    async function pump() {
+      try {
+        while (true) {
+          if (signal?.aborted) {
+            abort()
+            return
+          }
+
+          const { done, value } = await reader.read()
+          if (done) {
+            finish()
+            return
+          }
+
+          downloadedBytes += value.byteLength
+          if (downloadedBytes > maxBytes) {
+            await reader.cancel()
+            finish(new Error(`文件太大，最大支持 ${MAX_UPLOAD_MB} MB`))
+            return
+          }
+
+          if (!writeStream.write(value)) {
+            await new Promise((resolveDrain) => writeStream.once('drain', resolveDrain))
+          }
+        }
+      } catch (error) {
+        finish(error)
+      }
+    }
+
+    writeStream.on('error', finish)
+    signal?.addEventListener('abort', abort, { once: true })
+    pump()
+  })
 }
 
 function isValidUploadId(uploadId) {
