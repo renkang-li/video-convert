@@ -62,7 +62,7 @@ app.innerHTML = `
         <div class="actions">
           <button id="convertBtn" class="primary" type="button" disabled>
             <span class="button-icon">▶</span>
-            上传并转换
+            开始转换
           </button>
           <button id="cancelBtn" class="danger hidden" type="button">
             <span class="button-icon">■</span>
@@ -160,7 +160,7 @@ function setFile(file) {
   refs.emptyState.classList.add('hidden')
   refs.fileMeta.textContent = `${file.name} · ${formatBytes(file.size)}`
   refs.statusText.textContent = '已选择文件'
-  refs.convertBtn.textContent = '上传并转换'
+  refs.convertBtn.textContent = '开始转换'
   refs.convertBtn.disabled = false
   renderProgress(0)
 }
@@ -173,7 +173,7 @@ function setVideoUrl(value) {
   if (!videoUrl) {
     refs.convertBtn.disabled = !state.file
     refs.statusText.textContent = state.file ? '已选择文件' : '等待文件'
-    refs.convertBtn.textContent = '上传并转换'
+    refs.convertBtn.textContent = '开始转换'
     return
   }
 
@@ -184,7 +184,7 @@ function setVideoUrl(value) {
   refs.preview.classList.remove('is-visible')
   refs.emptyState.classList.remove('hidden')
   refs.statusText.textContent = '已输入视频链接'
-  refs.convertBtn.textContent = '下载并转换'
+  refs.convertBtn.textContent = '开始转换'
   refs.convertBtn.disabled = false
   renderProgress(0)
 }

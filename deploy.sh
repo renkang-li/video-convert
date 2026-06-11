@@ -57,7 +57,21 @@ echo "==> Container status"
 docker ps --filter "name=${APP_NAME}" --format 'table {{.Names}}\t{{.Image}}\t{{.Ports}}\t{{.Status}}'
 
 echo "==> Health check"
-curl -fsSI --max-time 20 "$HEALTH_URL" | sed -n '1,8p'
+for attempt in $(seq 1 10); do
+  if curl -fsSI --max-time 20 "$HEALTH_URL" >/tmp/${APP_NAME}-health.txt; then
+    sed -n '1,8p' /tmp/${APP_NAME}-health.txt
+    break
+  fi
+
+  if [[ "$attempt" == "10" ]]; then
+    cat /tmp/${APP_NAME}-health.txt 2>/dev/null || true
+    echo "Health check failed after ${attempt} attempts."
+    exit 1
+  fi
+
+  echo "Health check failed, retrying (${attempt}/10)..."
+  sleep 2
+done
 
 echo "==> Recent logs"
 docker logs --tail 30 "$APP_NAME"
