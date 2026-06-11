@@ -54,6 +54,8 @@ const MIME_TYPES = {
 }
 
 const app = express()
+app.disable('x-powered-by')
+
 const upload = multer({
   dest: TMP_DIR,
   limits: {
@@ -66,6 +68,18 @@ await mkdir(TMP_DIR, { recursive: true })
 
 app.use((request, response, next) => {
   response.setHeader('X-Content-Type-Options', 'nosniff')
+  next()
+})
+
+app.use('/api/convert', (request, response, next) => {
+  const startedAt = Date.now()
+  const uploadSize = Number(request.headers['content-length'] || 0)
+
+  response.on('finish', () => {
+    const durationSeconds = ((Date.now() - startedAt) / 1000).toFixed(2)
+    console.log(`[convert] status=${response.statusCode} duration=${durationSeconds}s request=${formatBytes(uploadSize)}`)
+  })
+
   next()
 })
 
@@ -197,4 +211,11 @@ function removeExtension(name) {
 
 function sanitizeName(name) {
   return name.replace(/[^\w.-]+/g, '-').replace(/^-+|-+$/g, '')
+}
+
+function formatBytes(bytes) {
+  if (!bytes) return '0 B'
+  const units = ['B', 'KB', 'MB', 'GB']
+  const index = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1)
+  return `${(bytes / 1024 ** index).toFixed(index ? 1 : 0)} ${units[index]}`
 }

@@ -13,7 +13,8 @@ const state = {
   file: null,
   inputUrl: '',
   outputUrl: '',
-  isWorking: false
+  isWorking: false,
+  uploadStartedAt: 0
 }
 
 app.innerHTML = `
@@ -142,6 +143,7 @@ function convertVideoCodec() {
 
   cleanupOutput()
   state.isWorking = true
+  state.uploadStartedAt = performance.now()
   refs.convertBtn.disabled = true
   refs.statusText.textContent = '上传视频'
   renderProgress(0)
@@ -158,7 +160,12 @@ function convertVideoCodec() {
   request.upload.onprogress = (event) => {
     if (!event.lengthComputable) return
     const uploadProgress = event.loaded / event.total
-    renderProgress(Math.min(45, Math.round(uploadProgress * 45)))
+    const percent = Math.min(45, Math.round(uploadProgress * 45))
+    const elapsedSeconds = Math.max((performance.now() - state.uploadStartedAt) / 1000, 0.1)
+    const uploadSpeed = event.loaded / elapsedSeconds
+
+    refs.statusText.textContent = `上传视频 ${formatBytes(event.loaded)} / ${formatBytes(event.total)}`
+    renderProgress(percent, `${Math.round(uploadProgress * 100)}% · ${formatBytes(uploadSpeed)}/s`)
   }
 
   request.onloadstart = () => {
@@ -191,9 +198,9 @@ function convertVideoCodec() {
   }
 
   request.upload.onload = () => {
-    refs.statusText.textContent = `服务器转码为 ${CODECS[codec]}`
+    refs.statusText.textContent = `上传完成，服务器转码为 ${CODECS[codec]}`
     refs.progressShell.classList.add('is-indeterminate')
-    renderProgress(45)
+    renderProgress(45, '转码中')
   }
 
   request.send(formData)
@@ -204,10 +211,10 @@ function finishRequest() {
   refs.convertBtn.disabled = !state.file
 }
 
-function renderProgress(progress) {
+function renderProgress(progress, label = '') {
   const percent = Math.max(0, Math.min(100, progress))
   refs.progressBar.style.width = `${percent}%`
-  refs.progressText.textContent = refs.progressShell.classList.contains('is-indeterminate') ? '转码中' : `${percent}%`
+  refs.progressText.textContent = label || (refs.progressShell.classList.contains('is-indeterminate') ? '转码中' : `${percent}%`)
 }
 
 function cleanupOutput() {

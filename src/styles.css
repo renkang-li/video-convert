@@ -302,7 +302,7 @@ video.is-visible {
 
 .status-band {
   display: grid;
-  grid-template-columns: minmax(150px, 240px) 1fr 54px;
+  grid-template-columns: minmax(190px, 320px) 1fr minmax(92px, 150px);
   gap: 16px;
   align-items: center;
   padding: 18px 22px;
@@ -343,6 +343,7 @@ video.is-visible {
   font-variant-numeric: tabular-nums;
   font-weight: 800;
   text-align: right;
+  white-space: nowrap;
 }
 
 @keyframes progressPulse {
