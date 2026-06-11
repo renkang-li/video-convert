@@ -7,6 +7,8 @@ const CODECS = {
   mpeg4: 'MPEG-4 Part 2'
 }
 
+const CHUNK_SIZE = 4 * 1024 * 1024
+
 const app = document.querySelector('#app')
 
 const state = {
@@ -16,6 +18,7 @@ const state = {
   isWorking: false,
   uploadStartedAt: 0,
   activeRequest: null,
+  activeUploadId: '',
   didCancel: false
 }
 
@@ -146,7 +149,7 @@ function setFile(file) {
   renderProgress(0)
 }
 
-function convertVideoCodec() {
+async function convertVideoCodec() {
   if (!state.file || state.isWorking) return
 
   cleanupOutput()
@@ -158,91 +161,178 @@ function convertVideoCodec() {
   refs.statusText.textContent = '上传视频'
   renderProgress(0)
 
-  const codec = refs.codecSelect.value
-  const formData = new FormData()
-  formData.append('video', state.file)
-  formData.append('codec', codec)
+  try {
+    const codec = refs.codecSelect.value
+    const { uploadId } = await createUploadSession()
+    state.activeUploadId = uploadId
 
-  const request = new XMLHttpRequest()
-  state.activeRequest = request
-  request.open('POST', '/api/convert')
-  request.responseType = 'blob'
+    await uploadFileChunks(uploadId)
 
-  request.upload.onprogress = (event) => {
-    if (!event.lengthComputable) return
-    const uploadProgress = event.loaded / event.total
-    const percent = Math.min(45, Math.round(uploadProgress * 45))
-    const elapsedSeconds = Math.max((performance.now() - state.uploadStartedAt) / 1000, 0.1)
-    const uploadSpeed = event.loaded / elapsedSeconds
+    refs.statusText.textContent = `上传完成，服务器合并并转码为 ${CODECS[codec]}`
+    refs.progressShell.classList.add('is-indeterminate')
+    renderProgress(78, '转码中')
 
-    refs.statusText.textContent = `上传视频 ${formatBytes(event.loaded)} / ${formatBytes(event.total)}`
-    renderProgress(percent, `${Math.round(uploadProgress * 100)}% · ${formatBytes(uploadSpeed)}/s`)
-  }
-
-  request.onloadstart = () => {
-    refs.statusText.textContent = '上传视频'
-  }
-
-  request.onload = async () => {
-    refs.progressShell.classList.remove('is-indeterminate')
-
-    if (request.status < 200 || request.status >= 300) {
-      refs.statusText.textContent = await readError(request.response)
-      finishRequest()
-      return
-    }
-
-    const filename = getFilenameFromDisposition(request.getResponseHeader('Content-Disposition')) || `video-${codec}.mp4`
-    state.outputUrl = URL.createObjectURL(request.response)
+    const result = await completeUpload(uploadId, codec)
+    const filename = getFilenameFromDisposition(result.disposition) || `video-${codec}.mp4`
+    state.outputUrl = URL.createObjectURL(result.blob)
     refs.downloadBtn.href = state.outputUrl
     refs.downloadBtn.download = filename
     refs.downloadBtn.classList.remove('hidden')
     refs.statusText.textContent = `已转换为 ${CODECS[codec]}`
-    renderProgress(100)
-    finishRequest()
-  }
-
-  request.onerror = () => {
     refs.progressShell.classList.remove('is-indeterminate')
+    renderProgress(100)
+  } catch (error) {
+    refs.progressShell.classList.remove('is-indeterminate')
+
     if (state.didCancel) {
       refs.statusText.textContent = '已停止上传并清理'
       renderProgress(0)
-      finishRequest()
-      return
+    } else {
+      refs.statusText.textContent = error.message || '转换失败'
+    }
+  } finally {
+    finishRequest()
+  }
+}
+
+async function createUploadSession() {
+  const response = await fetch('/api/uploads', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      filename: state.file.name,
+      size: state.file.size
+    })
+  })
+
+  if (!response.ok) {
+    throw new Error(await readResponseError(response))
+  }
+
+  return response.json()
+}
+
+async function uploadFileChunks(uploadId) {
+  const totalChunks = Math.ceil(state.file.size / CHUNK_SIZE)
+  let uploadedBytes = 0
+
+  for (let index = 0; index < totalChunks; index += 1) {
+    if (state.didCancel) throw new Error('已停止上传')
+
+    const start = index * CHUNK_SIZE
+    const end = Math.min(start + CHUNK_SIZE, state.file.size)
+    const chunk = state.file.slice(start, end)
+
+    refs.statusText.textContent = `上传分片 ${index + 1} / ${totalChunks}`
+    await uploadChunk(uploadId, index, chunk, (loaded) => {
+      const sentBytes = uploadedBytes + loaded
+      const uploadProgress = sentBytes / state.file.size
+      const elapsedSeconds = Math.max((performance.now() - state.uploadStartedAt) / 1000, 0.1)
+      const uploadSpeed = sentBytes / elapsedSeconds
+      const progress = Math.min(76, Math.round(uploadProgress * 76))
+
+      refs.statusText.textContent = `上传视频 ${formatBytes(sentBytes)} / ${formatBytes(state.file.size)}`
+      renderProgress(progress, `${Math.round(uploadProgress * 100)}% · ${formatBytes(uploadSpeed)}/s`)
+    })
+
+    uploadedBytes += chunk.size
+  }
+}
+
+function uploadChunk(uploadId, index, chunk, onProgress) {
+  return new Promise((resolvePromise, reject) => {
+    const formData = new FormData()
+    formData.append('chunk', chunk, `${index}.part`)
+
+    const request = new XMLHttpRequest()
+    state.activeRequest = request
+    request.open('POST', `/api/uploads/${uploadId}/chunks/${index}`)
+
+    request.upload.onprogress = (event) => {
+      if (!event.lengthComputable) return
+      onProgress(event.loaded)
     }
 
-    refs.statusText.textContent = '网络错误，转换失败'
-    finishRequest()
-  }
+    request.onload = () => {
+      state.activeRequest = null
+      if (request.status >= 200 && request.status < 300) {
+        resolvePromise()
+        return
+      }
 
-  request.onabort = () => {
-    refs.progressShell.classList.remove('is-indeterminate')
-    refs.statusText.textContent = '已停止上传并清理'
-    renderProgress(0)
-    finishRequest()
-  }
+      reject(new Error(readRequestError(request)))
+    }
 
-  request.upload.onload = () => {
-    refs.statusText.textContent = `上传完成，服务器转码为 ${CODECS[codec]}`
-    refs.progressShell.classList.add('is-indeterminate')
-    renderProgress(45, '转码中')
-  }
+    request.onerror = () => {
+      state.activeRequest = null
+      reject(new Error(state.didCancel ? '已停止上传' : '网络错误，上传失败'))
+    }
 
-  request.send(formData)
+    request.onabort = () => {
+      state.activeRequest = null
+      reject(new Error('已停止上传'))
+    }
+
+    request.send(formData)
+  })
+}
+
+function completeUpload(uploadId, codec) {
+  return new Promise((resolvePromise, reject) => {
+    const request = new XMLHttpRequest()
+    state.activeRequest = request
+    request.open('POST', `/api/uploads/${uploadId}/complete`)
+    request.setRequestHeader('Content-Type', 'application/json')
+    request.responseType = 'blob'
+
+    request.onload = async () => {
+      state.activeRequest = null
+      if (request.status >= 200 && request.status < 300) {
+        resolvePromise({
+          blob: request.response,
+          disposition: request.getResponseHeader('Content-Disposition')
+        })
+        return
+      }
+
+      reject(new Error(await readError(request.response)))
+    }
+
+    request.onerror = () => {
+      state.activeRequest = null
+      reject(new Error(state.didCancel ? '已停止上传' : '网络错误，转换失败'))
+    }
+
+    request.onabort = () => {
+      state.activeRequest = null
+      reject(new Error('已停止上传'))
+    }
+
+    request.send(JSON.stringify({
+      codec,
+      filename: state.file.name,
+      totalChunks: Math.ceil(state.file.size / CHUNK_SIZE)
+    }))
+  })
 }
 
 function cancelActiveRequest() {
-  if (!state.activeRequest || !state.isWorking) return
+  if (!state.isWorking) return
 
   state.didCancel = true
   refs.statusText.textContent = '正在停止'
   refs.cancelBtn.disabled = true
-  state.activeRequest.abort()
+  state.activeRequest?.abort()
+
+  if (state.activeUploadId) {
+    fetch(`/api/uploads/${state.activeUploadId}`, { method: 'DELETE' }).catch(() => {})
+  }
 }
 
 function finishRequest() {
   state.isWorking = false
   state.activeRequest = null
+  state.activeUploadId = ''
   refs.convertBtn.disabled = !state.file
   refs.cancelBtn.disabled = false
   refs.cancelBtn.classList.add('hidden')
@@ -268,6 +358,24 @@ async function readError(blob) {
     return data.error || '转换失败'
   } catch {
     return '转换失败'
+  }
+}
+
+async function readResponseError(response) {
+  try {
+    const data = await response.json()
+    return data.error || '请求失败'
+  } catch {
+    return '请求失败'
+  }
+}
+
+function readRequestError(request) {
+  try {
+    const data = JSON.parse(request.responseText)
+    return data.error || '上传失败'
+  } catch {
+    return '上传失败'
   }
 }
 

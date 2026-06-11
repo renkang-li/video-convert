@@ -1,4 +1,4 @@
-import { createReadStream, existsSync, statSync } from 'node:fs'
+import { createReadStream, createWriteStream, existsSync, statSync } from 'node:fs'
 import { mkdir, readdir, rm, stat } from 'node:fs/promises'
 import { randomUUID } from 'node:crypto'
 import { spawn } from 'node:child_process'
@@ -12,7 +12,9 @@ const DIST_DIR = resolve('dist')
 const TMP_DIR = resolve(process.env.UPLOAD_DIR || 'tmp')
 const FFMPEG_BIN = process.env.FFMPEG_PATH || 'ffmpeg'
 const MAX_UPLOAD_MB = Number(process.env.MAX_UPLOAD_MB || 2048)
+const CHUNK_UPLOAD_MB = Number(process.env.CHUNK_UPLOAD_MB || 16)
 const TMP_FILE_MAX_AGE_MS = Number(process.env.TMP_FILE_MAX_AGE_MIN || 30) * 60 * 1000
+const UPLOAD_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 
 const CODECS = {
   h264: {
@@ -77,6 +79,36 @@ const upload = multer({
   }
 })
 
+const chunkStorage = multer.diskStorage({
+  destination(request, file, callback) {
+    const uploadId = request.params.uploadId
+    const chunkIndex = Number(request.params.chunkIndex)
+
+    if (!isValidUploadId(uploadId) || !Number.isSafeInteger(chunkIndex) || chunkIndex < 0) {
+      callback(new Error('上传分片参数无效'))
+      return
+    }
+
+    const chunkDir = getChunkDir(uploadId)
+    mkdir(chunkDir, { recursive: true })
+      .then(() => callback(null, chunkDir))
+      .catch((error) => callback(error))
+  },
+  filename(request, file, callback) {
+    const chunkPath = getChunkPath(request.params.uploadId, request.params.chunkIndex)
+    request.uploadTempPaths = [...(request.uploadTempPaths || []), chunkPath]
+    callback(null, `${Number(request.params.chunkIndex)}.part`)
+  }
+})
+
+const chunkUpload = multer({
+  storage: chunkStorage,
+  limits: {
+    fileSize: CHUNK_UPLOAD_MB * 1024 * 1024,
+    files: 1
+  }
+})
+
 await mkdir(TMP_DIR, { recursive: true })
 await cleanupStaleTempFiles()
 setInterval(cleanupStaleTempFiles, 5 * 60 * 1000).unref()
@@ -85,6 +117,8 @@ app.use((request, response, next) => {
   response.setHeader('X-Content-Type-Options', 'nosniff')
   next()
 })
+
+app.use(express.json({ limit: '1mb' }))
 
 app.use('/api/convert', (request, response, next) => {
   const startedAt = Date.now()
@@ -111,6 +145,115 @@ app.use('/api/convert', (request, response, next) => {
   })
 
   next()
+})
+
+app.use('/api/uploads', (request, response, next) => {
+  const startedAt = Date.now()
+  const uploadSize = Number(request.headers['content-length'] || 0)
+  let finished = false
+
+  response.on('finish', () => {
+    finished = true
+    const durationSeconds = ((Date.now() - startedAt) / 1000).toFixed(2)
+    console.log(`[upload] ${request.method} ${request.path} status=${response.statusCode} duration=${durationSeconds}s request=${formatBytes(uploadSize)}`)
+  })
+
+  request.on('aborted', () => {
+    const durationSeconds = ((Date.now() - startedAt) / 1000).toFixed(2)
+    console.warn(`[upload] aborted ${request.method} ${request.path} duration=${durationSeconds}s request=${formatBytes(uploadSize)}`)
+    setTimeout(() => cleanupFiles(...(request.uploadTempPaths || [])), 1000).unref()
+  })
+
+  response.on('close', () => {
+    if (finished) return
+    const durationSeconds = ((Date.now() - startedAt) / 1000).toFixed(2)
+    console.warn(`[upload] closed ${request.method} ${request.path} duration=${durationSeconds}s request=${formatBytes(uploadSize)}`)
+    setTimeout(() => cleanupFiles(...(request.uploadTempPaths || [])), 1000).unref()
+  })
+
+  next()
+})
+
+app.post('/api/uploads', async (request, response) => {
+  const uploadId = randomUUID()
+  await mkdir(getChunkDir(uploadId), { recursive: true })
+  response.json({ uploadId, chunkSizeMb: CHUNK_UPLOAD_MB })
+})
+
+app.post('/api/uploads/:uploadId/chunks/:chunkIndex', chunkUpload.single('chunk'), (request, response) => {
+  if (!request.file) {
+    response.status(400).json({ error: '缺少上传分片' })
+    return
+  }
+
+  response.json({ ok: true, size: request.file.size })
+})
+
+app.post('/api/uploads/:uploadId/complete', async (request, response) => {
+  const { uploadId } = request.params
+  const codecName = request.body?.codec
+  const totalChunks = Number(request.body?.totalChunks)
+  const originalName = String(request.body?.filename || 'video')
+  const codec = CODECS[codecName]
+
+  if (!isValidUploadId(uploadId)) {
+    response.status(400).json({ error: '上传会话无效' })
+    return
+  }
+
+  if (!Number.isSafeInteger(totalChunks) || totalChunks < 1 || totalChunks > 20000) {
+    response.status(400).json({ error: '分片数量无效' })
+    return
+  }
+
+  if (!codec) {
+    response.status(400).json({ error: '目标编码不支持' })
+    return
+  }
+
+  const uploadDir = getUploadDir(uploadId)
+  const inputPath = join(uploadDir, 'input')
+  const outputPath = join(uploadDir, `output.${codec.extension}`)
+  const outputName = `${sanitizeName(removeExtension(originalName)) || 'video'}-${codecName}.${codec.extension}`
+  const abortController = new AbortController()
+  request.uploadTempPaths = [uploadDir]
+
+  response.on('close', () => {
+    if (!response.writableEnded) abortController.abort()
+  })
+
+  try {
+    await mergeChunks(uploadId, totalChunks, inputPath, abortController.signal)
+    await runFFmpeg(['-hide_banner', '-y', '-i', inputPath, ...codec.args, outputPath], abortController.signal)
+
+    if (abortController.signal.aborted || response.destroyed) {
+      await cleanupFiles(uploadDir)
+      return
+    }
+
+    response.setHeader('Content-Type', codec.mime)
+    response.setHeader('Content-Disposition', contentDisposition(outputName))
+    response.setHeader('Cache-Control', 'no-store')
+    createReadStream(outputPath).pipe(response)
+    response.on('finish', () => cleanupFiles(uploadDir))
+    response.on('close', () => cleanupFiles(uploadDir))
+  } catch (error) {
+    await cleanupFiles(uploadDir)
+    if (abortController.signal.aborted || response.destroyed) return
+    response.status(500).json({ error: error.message || '转换失败' })
+  }
+})
+
+app.delete('/api/uploads/:uploadId', async (request, response) => {
+  const { uploadId } = request.params
+
+  if (!isValidUploadId(uploadId)) {
+    response.status(400).json({ error: '上传会话无效' })
+    return
+  }
+
+  await cleanupFiles(getUploadDir(uploadId))
+  response.status(204).end()
 })
 
 app.post('/api/convert', upload.single('video'), async (request, response) => {
@@ -268,7 +411,7 @@ async function cleanupFiles(...paths) {
 
 async function removeFile(path) {
   if (!path) return
-  await rm(path, { force: true })
+  await rm(path, { force: true, recursive: true })
 }
 
 async function cleanupStaleTempFiles() {
@@ -280,7 +423,7 @@ async function cleanupStaleTempFiles() {
     await Promise.allSettled(entries.map(async (entry) => {
       const filePath = join(TMP_DIR, entry)
       const fileStat = await stat(filePath)
-      if (!fileStat.isFile()) return
+      if (!fileStat.isFile() && !fileStat.isDirectory()) return
       if (now - fileStat.mtimeMs < TMP_FILE_MAX_AGE_MS) return
 
       await removeFile(filePath)
@@ -302,6 +445,75 @@ function removeExtension(name) {
 
 function sanitizeName(name) {
   return name.replace(/[^\w.-]+/g, '-').replace(/^-+|-+$/g, '')
+}
+
+function isValidUploadId(uploadId) {
+  return typeof uploadId === 'string' && UPLOAD_ID_PATTERN.test(uploadId)
+}
+
+function getUploadDir(uploadId) {
+  return join(TMP_DIR, uploadId)
+}
+
+function getChunkDir(uploadId) {
+  return join(getUploadDir(uploadId), 'chunks')
+}
+
+function getChunkPath(uploadId, chunkIndex) {
+  return join(getChunkDir(uploadId), `${Number(chunkIndex)}.part`)
+}
+
+async function mergeChunks(uploadId, totalChunks, inputPath, signal) {
+  const writeStream = createWriteStream(inputPath)
+
+  try {
+    for (let index = 0; index < totalChunks; index += 1) {
+      if (signal?.aborted) throw new Error('上传已停止')
+
+      const chunkPath = getChunkPath(uploadId, index)
+      await stat(chunkPath)
+      await appendFileToStream(chunkPath, writeStream, signal)
+    }
+  } finally {
+    await new Promise((resolvePromise) => writeStream.end(resolvePromise))
+  }
+}
+
+function appendFileToStream(filePath, writeStream, signal) {
+  return new Promise((resolvePromise, reject) => {
+    const readStream = createReadStream(filePath)
+
+    function cleanup() {
+      readStream.off('error', reject)
+      readStream.off('end', resolvePromise)
+      signal?.removeEventListener('abort', abort)
+    }
+
+    function abort() {
+      cleanup()
+      readStream.destroy()
+      reject(new Error('上传已停止'))
+    }
+
+    readStream.on('error', (error) => {
+      cleanup()
+      reject(error)
+    })
+
+    readStream.on('end', () => {
+      cleanup()
+      resolvePromise()
+    })
+
+    signal?.addEventListener('abort', abort, { once: true })
+
+    readStream.on('data', (chunk) => {
+      if (!writeStream.write(chunk)) {
+        readStream.pause()
+        writeStream.once('drain', () => readStream.resume())
+      }
+    })
+  })
 }
 
 function formatBytes(bytes) {
