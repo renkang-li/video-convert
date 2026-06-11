@@ -1,5 +1,5 @@
 import { createReadStream, existsSync, statSync } from 'node:fs'
-import { mkdir, rm } from 'node:fs/promises'
+import { mkdir, readdir, rm, stat } from 'node:fs/promises'
 import { randomUUID } from 'node:crypto'
 import { spawn } from 'node:child_process'
 import { extname, join, resolve } from 'node:path'
@@ -12,6 +12,7 @@ const DIST_DIR = resolve('dist')
 const TMP_DIR = resolve(process.env.UPLOAD_DIR || 'tmp')
 const FFMPEG_BIN = process.env.FFMPEG_PATH || 'ffmpeg'
 const MAX_UPLOAD_MB = Number(process.env.MAX_UPLOAD_MB || 2048)
+const TMP_FILE_MAX_AGE_MS = Number(process.env.TMP_FILE_MAX_AGE_MIN || 30) * 60 * 1000
 
 const CODECS = {
   h264: {
@@ -65,6 +66,8 @@ const upload = multer({
 })
 
 await mkdir(TMP_DIR, { recursive: true })
+await cleanupStaleTempFiles()
+setInterval(cleanupStaleTempFiles, 5 * 60 * 1000).unref()
 
 app.use((request, response, next) => {
   response.setHeader('X-Content-Type-Options', 'nosniff')
@@ -74,10 +77,23 @@ app.use((request, response, next) => {
 app.use('/api/convert', (request, response, next) => {
   const startedAt = Date.now()
   const uploadSize = Number(request.headers['content-length'] || 0)
+  let finished = false
 
   response.on('finish', () => {
+    finished = true
     const durationSeconds = ((Date.now() - startedAt) / 1000).toFixed(2)
     console.log(`[convert] status=${response.statusCode} duration=${durationSeconds}s request=${formatBytes(uploadSize)}`)
+  })
+
+  request.on('aborted', () => {
+    const durationSeconds = ((Date.now() - startedAt) / 1000).toFixed(2)
+    console.warn(`[convert] aborted duration=${durationSeconds}s request=${formatBytes(uploadSize)}`)
+  })
+
+  response.on('close', () => {
+    if (finished) return
+    const durationSeconds = ((Date.now() - startedAt) / 1000).toFixed(2)
+    console.warn(`[convert] closed status=${response.statusCode} duration=${durationSeconds}s request=${formatBytes(uploadSize)}`)
   })
 
   next()
@@ -85,7 +101,8 @@ app.use('/api/convert', (request, response, next) => {
 
 app.post('/api/convert', upload.single('video'), async (request, response) => {
   const file = request.file
-  const codec = CODECS[request.body.codec]
+  const codecName = request.body?.codec
+  const codec = CODECS[codecName]
 
   if (!file) {
     response.status(400).json({ error: '请选择视频文件' })
@@ -99,7 +116,7 @@ app.post('/api/convert', upload.single('video'), async (request, response) => {
   }
 
   const outputPath = join(TMP_DIR, `${randomUUID()}.${codec.extension}`)
-  const outputName = `${sanitizeName(removeExtension(file.originalname)) || 'video'}-${request.body.codec}.${codec.extension}`
+  const outputName = `${sanitizeName(removeExtension(file.originalname)) || 'video'}-${codecName}.${codec.extension}`
 
   try {
     await runFFmpeg(['-hide_banner', '-y', '-i', file.path, ...codec.args, outputPath])
@@ -198,6 +215,26 @@ async function cleanupFiles(...paths) {
 async function removeFile(path) {
   if (!path) return
   await rm(path, { force: true })
+}
+
+async function cleanupStaleTempFiles() {
+  const now = Date.now()
+
+  try {
+    const entries = await readdir(TMP_DIR)
+
+    await Promise.allSettled(entries.map(async (entry) => {
+      const filePath = join(TMP_DIR, entry)
+      const fileStat = await stat(filePath)
+      if (!fileStat.isFile()) return
+      if (now - fileStat.mtimeMs < TMP_FILE_MAX_AGE_MS) return
+
+      await removeFile(filePath)
+      console.warn(`[tmp] removed stale file ${entry} size=${formatBytes(fileStat.size)}`)
+    }))
+  } catch (error) {
+    console.warn(`[tmp] cleanup failed: ${error.message}`)
+  }
 }
 
 function contentDisposition(filename) {
